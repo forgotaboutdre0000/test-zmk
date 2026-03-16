@@ -4,15 +4,21 @@ import csv
 from pathlib import Path
 
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
+from typing import Optional
 
 from normalizer.pdf_zmk_normalizer import generate_pdf_zmk_values
 from normalizer.pdf_zmk2_normalizer import generate_pdf_zmk2_values
+from ves.resolver import generate_pdf_zmk_ves_values, load_positions
 
 
-SPREADSHEET_ID = "1gT9H5wAfs-MRzId0E5TarF7Qo6pvNOl0lsUbWIi_1kc"
+SPREADSHEET_ID = "1JOtZ6PNEPsYw-0y8NP23KE6rXL8YtGtLYhuhdVeqG0U"
 SHEET_NAME = "PDF_ZMK"
 SHEET_NAME_SPEC = "PDF_ZMK2"
+SHEET_NAME_VES = "PDF_ZMK_VES"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 RAW_ITEMS_530_12 = [
@@ -526,11 +532,85 @@ def transform_to_spec_rows(items: list[dict]) -> list[list[str]]:
 
 
 def get_sheets_service():
-    creds = Credentials.from_authorized_user_file(
-        "token.json",
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
+    """
+    Возвращает клиент Google Sheets.
+
+    Если token.json существует — использует его.
+    Если нет или он некорректен — запускает OAuth flow по credentials.json
+    и сохраняет новый token.json.
+    """
+    token_path = Path("token.json")
+    creds: Optional[Credentials] = None
+
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), scopes=SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            # Попытка обновить по refresh_token
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+
+        if not creds or not creds.valid:
+            # Полный интерактивный flow
+            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+            creds = flow.run_local_server(port=0)
+        token_path.write_text(creds.to_json(), encoding="utf-8")
+
     return build("sheets", "v4", credentials=creds)
+
+
+def _get_sheet_ids_by_title(service) -> dict[str, int]:
+    spreadsheet = service.spreadsheets().get(
+        spreadsheetId=SPREADSHEET_ID,
+        fields="sheets(properties.sheetId,properties.title)",
+    ).execute()
+    mapping: dict[str, int] = {}
+    for sh in spreadsheet.get("sheets", []):
+        props = sh.get("properties", {})
+        title = props.get("title")
+        sheet_id = props.get("sheetId")
+        if isinstance(title, str) and isinstance(sheet_id, int):
+            mapping[title] = sheet_id
+    return mapping
+
+
+def _ensure_sheet_exists(service, title: str) -> int:
+    """
+    Возвращает sheetId для листа с заданным названием, создавая лист при необходимости.
+    """
+    ids = _get_sheet_ids_by_title(service)
+    if title in ids:
+        return ids[title]
+
+    add_request = {
+        "requests": [
+            {
+                "addSheet": {
+                    "properties": {
+                        "title": title,
+                    }
+                }
+            }
+        ]
+    }
+    response = service.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body=add_request,
+    ).execute()
+    sheets = response.get("replies", [])
+    for reply in sheets:
+        props = reply.get("addSheet", {}).get("properties", {})
+        if props.get("title") == title:
+            sheet_id = props.get("sheetId")
+            if isinstance(sheet_id, int):
+                return sheet_id
+
+    # На всякий случай повторно читаем все листы
+    ids = _get_sheet_ids_by_title(service)
+    return ids[title]
 
 
 def main():
@@ -541,11 +621,12 @@ def main():
     data_dir.mkdir(exist_ok=True)
 
     # --- Лист PDF_ZMK: генерируем значения из raw-спецификаций и заливаем ---
+    _ensure_sheet_exists(service, SHEET_NAME)
     pdf_zmk_values = generate_pdf_zmk_values()
 
     service.spreadsheets().values().clear(
         spreadsheetId=SPREADSHEET_ID,
-        range=SHEET_NAME,
+        range=f"{SHEET_NAME}!A:Z",
         body={},
     ).execute()
 
@@ -557,16 +638,8 @@ def main():
     ).execute()
 
     # Стилизуем шапку: строки с группами/заголовками
-    spreadsheet = service.spreadsheets().get(
-        spreadsheetId=SPREADSHEET_ID,
-        fields="sheets(properties.sheetId,properties.title)",
-    ).execute()
-    sheet_id = None
-    for sh in spreadsheet.get("sheets", []):
-        props = sh.get("properties", {})
-        if props.get("title") == SHEET_NAME:
-            sheet_id = props.get("sheetId")
-            break
+    sheet_ids = _get_sheet_ids_by_title(service)
+    sheet_id = sheet_ids.get(SHEET_NAME)
 
     if sheet_id is not None and len(pdf_zmk_values) >= 2:
         requests = [
@@ -644,11 +717,12 @@ def main():
         ).execute()
 
     # --- Лист PDF_ZMK2: генерируем значения и заливаем ---
+    _ensure_sheet_exists(service, SHEET_NAME_SPEC)
     pdf_spec_values = generate_pdf_zmk2_values()
 
     service.spreadsheets().values().clear(
         spreadsheetId=SPREADSHEET_ID,
-        range=SHEET_NAME_SPEC,
+        range=f"{SHEET_NAME_SPEC}!A:Z",
         body={},
     ).execute()
 
@@ -658,6 +732,30 @@ def main():
         valueInputOption="RAW",
         body={"values": pdf_spec_values},
     ).execute()
+
+    # --- Лист PDF_ZMK_VES: генерируем значения по опорам и заливаем ---
+    ves_positions_path = Path("ves") / "test_positions.txt"
+    positions = load_positions(ves_positions_path)
+
+    if positions:
+        # Для тестового списка позиций всегда форсим онлайн-обновление весов
+        pdf_ves_values = generate_pdf_zmk_ves_values(
+            positions, online=True, force_refresh=True
+        )
+
+        _ensure_sheet_exists(service, SHEET_NAME_VES)
+        service.spreadsheets().values().clear(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME_VES}!A:Z",
+            body={},
+        ).execute()
+
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME_VES}!A1",
+            valueInputOption="RAW",
+            body={"values": pdf_ves_values},
+        ).execute()
 
 
 if __name__ == "__main__":
