@@ -45,7 +45,12 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _load_db(path: Path = DB_PATH) -> Dict[str, dict]:
+def _current_db_path(path: Path | None = None) -> Path:
+    return path if path is not None else DB_PATH
+
+
+def _load_db(path: Path | None = None) -> Dict[str, dict]:
+    path = _current_db_path(path)
     if not path.exists():
         return {}
     try:
@@ -59,7 +64,8 @@ def _load_db(path: Path = DB_PATH) -> Dict[str, dict]:
         return {}
 
 
-def _save_db(db: Dict[str, dict], path: Path = DB_PATH) -> None:
+def _save_db(db: Dict[str, dict], path: Path | None = None) -> None:
+    path = _current_db_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)

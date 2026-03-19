@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """
 Дебаг скрейпера opora-trub.ru для конкретных позиций.
-Запуск: python3 ves/debug_oporytrub.py
+Запуск: python -m ves.debug_oporytrub
 """
 from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-# корень проекта
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from urllib.parse import urljoin
 

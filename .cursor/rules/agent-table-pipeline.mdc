@@ -1,0 +1,41 @@
+---
+description: Mandatory agent-side table extraction pipeline for PDF_ZMK and PDF_ZMK2
+alwaysApply: true
+---
+
+# Agent Extraction Policy (PDF_ZMK + PDF_ZMK2)
+
+Both `pdf-zmk` and `pdf-zmk2` use the same strict pipeline.
+No steps can be skipped or replaced with stubs/fallbacks.
+
+## Step 1: crop + upscale
+Run `python -m app.cli <pdf-zmk|pdf-zmk2> full --input-dir <dir> --dry-run`.
+This creates `data/recognition/<slug>.table_x4.jpg` for every image input.
+If a valid `data/recognition/<slug>.json` with non-empty `items` already exists,
+the file is considered resolved and does not need re-reading.
+
+## Step 2: agent read
+For every `data/recognition/<slug>.table_x4.jpg` that has no corresponding
+`.json` with non-empty `items`:
+- The agent MUST open the crop image using the ReadFile tool.
+- The agent MUST read the specification table from the image.
+- For pdf-zmk: extract poz, designation, name, qty, weight.
+- For pdf-zmk2: extract elem, det, t, n, section, length, mass_sht, mass_total, mass_elem, steel, note.
+
+## Step 3: write JSON payload
+The agent writes `data/recognition/<slug>.json`.
+Empty `items` is forbidden. If the table cannot be read, the agent must report
+the failure explicitly — never write an empty payload.
+
+## Step 4: normalize + sheets
+Re-run the same command with `--sheet-write` instead of `--dry-run`.
+The CLI reads all payload JSONs, normalizes rows, writes to the target Google Sheet.
+If any payload has empty `items`, the run fails (fail-fast).
+
+## Rules
+- No local OCR.
+- No external LLM API keys.
+- No UNRESOLVED stubs.
+- No silent skips.
+- The agent reads crops. Always.
+- Both pdf-zmk and pdf-zmk2 follow this exact pipeline.
